@@ -37,11 +37,13 @@ public class Main {
     List<SpotObserver> observers = new ArrayList<>();
     observers.add(board);
 
+    // ⬆ HARDEN (Pass 2): the floor now creates each spot so it can inject the shared
+    // AtomicInteger counter (the spot moves it in lockstep inside its own lock).
     ParkingFloor floor = new ParkingFloor(1);
-    floor.addSpot(new ParkingSpot("M1", ParkingSpotType.MOTORCYCLE, observers));
-    floor.addSpot(new ParkingSpot("C1", ParkingSpotType.COMPACT, observers));
-    floor.addSpot(new ParkingSpot("C2", ParkingSpotType.COMPACT, observers));
-    floor.addSpot(new ParkingSpot("L1", ParkingSpotType.LARGE, observers));
+    floor.createSpot("M1", ParkingSpotType.MOTORCYCLE, observers);
+    floor.createSpot("C1", ParkingSpotType.COMPACT, observers);
+    floor.createSpot("C2", ParkingSpotType.COMPACT, observers);
+    floor.createSpot("L1", ParkingSpotType.LARGE, observers);
     lot.addFloor(floor);
 
     // 4. Gates sit in front of the lot.

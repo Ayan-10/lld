@@ -3,6 +3,7 @@ package models;
 import enums.ParkingSpotType;
 import enums.PaymentMethod;
 import enums.PaymentStatus;
+import enums.VehicleType;
 import exceptions.InvalidTicketException;
 import exceptions.LotFullException;
 import observers.SpotObserver;
@@ -13,13 +14,18 @@ import strategy.SpotAssignmentStrategy;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class ParkingLot {
-  private static ParkingLot instance;
+  // ⬆ HARDEN (Pass 2, H4): volatile so the double-checked-locking below publishes a fully
+  // constructed instance safely to other threads (no half-built object leaking).
+  private static volatile ParkingLot instance;
 
   private final List<ParkingFloor> floors;
   private final List<SpotObserver> observers;
   private SpotAssignmentStrategy assignmentStrategy;
+  // ⬆ HARDEN (Pass 2, H4): registry is now concurrent — multiple exit gates read/remove
+  // tickets in parallel; a plain HashMap would corrupt under concurrent structural edits.
   private final Map<String, Ticket> activeTickets;
   private FeeStrategy feeStrategy;
   private PaymentProcessor paymentProcessor;
@@ -27,12 +33,20 @@ public class ParkingLot {
   private ParkingLot() {
     this.floors = new ArrayList<>();
     this.observers = new ArrayList<>();
-    this.activeTickets = new HashMap<>();
+    this.activeTickets = new ConcurrentHashMap<>();
   }
 
+  // ⬆ HARDEN (Pass 2, H4): double-checked locking. Fast path skips the lock once the
+  // instance exists; the synchronized block guards the first concurrent creation so two
+  // threads can't build two lots. (Alternative worth naming in the room: drop the
+  // hand-rolled Singleton for a Spring @Bean — easier to test.)
   public static ParkingLot getInstance() {
     if (instance == null) {
-      instance = new ParkingLot();
+      synchronized (ParkingLot.class) {
+        if (instance == null) {
+          instance = new ParkingLot();
+        }
+      }
     }
     return instance;
   }
@@ -53,33 +67,42 @@ public class ParkingLot {
     this.paymentProcessor = processor;
   }
 
+  // ⬆ HARDEN (Pass 2, H4): retry-next-candidate. tryAssign can now return false on a lost
+  // race, so instead of failing we loop to the next candidate spot. The counter is moved
+  // by the spot itself (inside its lock) — the orchestrator no longer touches it.
   public Ticket parkVehicle(Vehicle vehicle) throws LotFullException {
-    Optional<ParkingSpot> parkingSpotOpt = assignmentStrategy.findSpot(floors, vehicle.vehicleType);
-    ParkingSpot parkingSpot = parkingSpotOpt.orElse(null);
-    // FIX #1: no spot must THROW LotFullException, not silently return null
-    // (a null ticket propagates and breaks every downstream caller).
-    if (parkingSpot == null) {
-      throw new LotFullException("lot full");
+    VehicleType type = vehicle.getVehicleType();
+
+    for (ParkingFloor floor : floors) {
+      for (ParkingSpot spot : floor.candidateSpots(type)) {
+        if (spot.tryAssign(vehicle)) {          // atomic; may lose the race -> false
+          return createTicket(vehicle, spot);   // RECORD IT — unpark validates against this
+        }
+        // lost the race (or wrong fit) -> just try the next candidate spot
+      }
     }
 
-    boolean assigned = parkingSpot.assignSpot(vehicle);
-
-    if (assigned) {
-      // FIX #2: keep the owning floor's live free-count in sync on park.
-      decrementFloorCount(parkingSpot);
-      // FIX #1: record the ticket in activeTickets via createTicket so unpark can
-      // later validate it (previously `new Ticket(...)` bypassed the registry,
-      // making every unparkVehicle fail validation).
-      return createTicket(vehicle, parkingSpot);
-    } else {
-      throw new LotFullException("lot full");
-    }
+    // FIX #1: no spot anywhere must THROW, never silently return null.
+    throw new LotFullException("No spot available for " + type);
   }
 
   // FIX #9: accept the PaymentMethod chosen at the exit gate instead of hardcoding CARD.
   public Receipt unparkVehicle(Ticket ticket, PaymentMethod method) throws InvalidTicketException {
-    // 1. Validate ticket
+    if (ticket == null) {
+      throw new InvalidTicketException("Ticket cannot be null");
+    }
+
+    // ⬆ HARDEN (Pass 2, H4): exit idempotency FIRST. A double-scan at the gate must not
+    // double-charge. Because a closed ticket is removed from activeTickets, we check the
+    // paid flag BEFORE registry validation — otherwise the second scan would wrongly throw
+    // InvalidTicket instead of being a harmless no-op.
+    if (ticket.isPaid()) {
+      return new Receipt(ticket.getId(), BigDecimal.ZERO, null);
+    }
+
+    // 1. Validate ticket (still open => must be a known, live ticket)
     validateTicket(ticket);
+
     // 2. stamp exitTime
     Instant exitTime = Instant.now();
     ticket.setExitTime(exitTime);
@@ -101,11 +124,9 @@ public class ParkingLot {
       );
     }
 
-    // 5. Free parking spot
+    // 5. Free parking spot (idempotent; increments the shared counter inside the spot lock).
     ParkingSpot spot = ticket.getParkingSpot();
     spot.freeSpot();
-    // FIX #2: mirror the park-time decrement — put the freed spot back into the count.
-    incrementFloorCount(spot);
 
     // 6. Mark ticket paid
     ticket.markPaid(true);
@@ -152,27 +173,6 @@ public class ParkingLot {
       // FIX #4: call the renamed single interface method (was onSpotChanged, which
       // no longer exists after collapsing SpotObserver to one callback).
       observer.onSpotStateChanged(parkingSpot);
-    }
-  }
-
-  // FIX #2: locate the floor that owns this spot and adjust its live free-count.
-  // Pass 1: plain lookups; Pass 2 will guard these under the same lock as the
-  // spot-status change so count and status never diverge.
-  private void decrementFloorCount(ParkingSpot spot) {
-    for (ParkingFloor floor : floors) {
-      if (floor.containsSpot(spot)) {
-        floor.decrementAvailable(spot.getType());
-        return;
-      }
-    }
-  }
-
-  private void incrementFloorCount(ParkingSpot spot) {
-    for (ParkingFloor floor : floors) {
-      if (floor.containsSpot(spot)) {
-        floor.incrementAvailable(spot.getType());
-        return;
-      }
     }
   }
 

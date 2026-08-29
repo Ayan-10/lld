@@ -2,12 +2,14 @@ package models;
 
 import enums.ParkingSpotType;
 import enums.VehicleType;
+import observers.SpotObserver;
 
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class ParkingFloor {
 
@@ -15,7 +17,11 @@ public class ParkingFloor {
 
   private final Map<ParkingSpotType, List<ParkingSpot>> spotsByType;
 
-  private final Map<ParkingSpotType, Integer> availableCountByType;
+  // ⬆ HARDEN (Pass 2, H3): counter type upgraded from Integer to AtomicInteger. The floor
+  // OWNS one AtomicInteger per type and hands the very same instance to each spot it creates,
+  // so the spot moves this exact counter inside its own lock. getAvailableCount() is now a
+  // lock-free atomic read, and decrement/incrementAvailable() disappear (the spot does it).
+  private final Map<ParkingSpotType, AtomicInteger> availableCountByType;
 
   public ParkingFloor(int floorNumber) {
     this.floorNumber = floorNumber;
@@ -25,17 +31,21 @@ public class ParkingFloor {
 
     for (ParkingSpotType type : ParkingSpotType.values()) {
       spotsByType.put(type, new ArrayList<>());
-      availableCountByType.put(type, 0);
+      availableCountByType.put(type, new AtomicInteger(0));
     }
   }
 
-  public void addSpot(ParkingSpot spot) {
-    ParkingSpotType type = spot.getType();
-
+  // ⬆ HARDEN (Pass 2, H3): the floor is now the factory for its spots, so it can inject the
+  // shared AtomicInteger. This replaces the old `new ParkingSpot(...)` + addSpot(spot) pair
+  // and guarantees the spot decrements the exact counter this floor reports.
+  public ParkingSpot createSpot(String id,
+                                ParkingSpotType type,
+                                List<SpotObserver> observers) {
+    AtomicInteger counter = availableCountByType.get(type);
+    ParkingSpot spot = new ParkingSpot(id, type, counter, observers);
     spotsByType.get(type).add(spot);
-
-    int currentCount = availableCountByType.get(type);
-    availableCountByType.put(type, currentCount + 1);
+    counter.incrementAndGet(); // a fresh AVAILABLE spot bumps the live free-count
+    return spot;
   }
 
   public List<ParkingSpot> candidateSpots(VehicleType v) {
@@ -67,24 +77,16 @@ public class ParkingFloor {
     return Optional.empty();
   }
 
-  // FIX #2: the live free-count must move as spots are taken/freed. These two methods
-  // let the park/unpark flow keep availableCountByType in sync (Pass 1: plain int math;
-  // Pass 2 will make this atomic/lock-guarded in lockstep with the spot status).
-  public void decrementAvailable(ParkingSpotType t) {
-    availableCountByType.put(t, availableCountByType.get(t) - 1);
+  // ⬆ HARDEN (Pass 2, H3): O(1) lock-free atomic read for the display board.
+  public int getAvailableCount(ParkingSpotType t) {
+    return availableCountByType.get(t).get();
   }
 
-  public void incrementAvailable(ParkingSpotType t) {
-    availableCountByType.put(t, availableCountByType.get(t) + 1);
-  }
-
-  // FIX #2: helper so the orchestrator can find the owning floor of a spot when freeing.
+  // ⬆ HARDEN (Pass 2, H3): the orchestrator no longer moves the count — the spot does it in
+  // lockstep inside tryAssign/freeSpot. containsSpot stays only so the lot can still locate a
+  // spot's floor for non-counter needs (e.g. maintenance), but it's no longer on the hot path.
   public boolean containsSpot(ParkingSpot spot) {
     return spotsByType.getOrDefault(spot.getType(), new ArrayList<>()).contains(spot);
-  }
-
-  public int getAvailableCount(ParkingSpotType t) {
-    return availableCountByType.get(t);
   }
 
   public int getFloorNumber() {
